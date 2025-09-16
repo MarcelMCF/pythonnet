@@ -1,4 +1,4 @@
-"""Python.NET runtime loading and configuration"""
+    """Python.NET runtime loading and configuration"""
 
 import sys
 from pathlib import Path
@@ -144,7 +144,7 @@ def load(runtime: Union[clr_loader.Runtime, str, None] = None, **params: str) ->
 
     if func(b"") != 0:
         raise RuntimeError("Failed to initialize Python.Runtime.dll")
-    
+
     _LOADED = True
 
     import atexit
