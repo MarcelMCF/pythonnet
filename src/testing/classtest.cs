@@ -70,5 +70,10 @@ namespace Python.Test
                 throw new Exception("Expected ISayHello and SimpleClass instance");
             }
         }
+
+        public virtual int GetNumber()
+        {
+            return 1;
+        }
     }
 }
