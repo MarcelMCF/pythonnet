@@ -33,6 +33,7 @@ namespace Python.Runtime
     {
         private static Dictionary<string, AssemblyBuilder> assemblyBuilders;
         private static Dictionary<Tuple<string, string>, ModuleBuilder> moduleBuilders;
+        private static HashSet<Type> typeHasFinalize = new();
 
         static ClassDerivedObject()
         {
@@ -271,34 +272,43 @@ namespace Python.Runtime
                 }
             }
 
-            // add the destructor so the python object created in the constructor gets destroyed
-            MethodBuilder methodBuilder = typeBuilder.DefineMethod("Finalize",
-                MethodAttributes.Family |
-                MethodAttributes.Virtual |
-                MethodAttributes.HideBySig,
-                CallingConventions.Standard,
-                typeof(void),
-                Type.EmptyTypes);
-            ILGenerator il = methodBuilder.GetILGenerator();
-            il.Emit(OpCodes.Ldarg_0);
+
+            // only add finalizer if it has not allready been added on a base type.
+            // otherwise PyFinalize will be called multiple times for the same object,
+            // causing an access violation exception.
+            if (typeHasFinalize.Contains(baseType) == false)
+            {
+                // add the destructor so the python object created in the constructor gets destroyed
+                MethodBuilder methodBuilder = typeBuilder.DefineMethod("Finalize",
+                    MethodAttributes.Family |
+                    MethodAttributes.Virtual |
+                    MethodAttributes.HideBySig,
+                    CallingConventions.Standard,
+                    typeof(void),
+                    Type.EmptyTypes);
+                ILGenerator il = methodBuilder.GetILGenerator();
+                il.Emit(OpCodes.Ldarg_0);
 #pragma warning disable CS0618 // PythonDerivedType is for internal use only
-            il.Emit(OpCodes.Call, typeof(PythonDerivedType).GetMethod(nameof(PyFinalize)));
+                il.Emit(OpCodes.Call, typeof(PythonDerivedType).GetMethod(nameof(PyFinalize)));
 #pragma warning restore CS0618 // PythonDerivedType is for internal use only
             il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Call, baseClass.GetMethod("Finalize", BindingFlags.NonPublic | BindingFlags.Instance));
             il.Emit(OpCodes.Ret);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Call, baseClass.GetMethod("Finalize", BindingFlags.NonPublic | BindingFlags.Instance));
+                il.Emit(OpCodes.Ret);
+            }
 
             Type type = typeBuilder.CreateType();
-
-            // scan the assembly so the newly added class can be imported
+            typeHasFinalize.Add(type);
+            // scan the assembly so the newly added class can be im ported
             Assembly assembly = Assembly.GetAssembly(type);
             AssemblyManager.ScanAssembly(assembly);
 
-            // FIXME: assemblyBuilder not used
-            AssemblyBuilder assemblyBuilder = assemblyBuilders[assemblyName];
-
             return type;
         }
+
+
 
         /// <summary>
         /// Add a constructor override that calls the python ctor after calling the base type constructor.
