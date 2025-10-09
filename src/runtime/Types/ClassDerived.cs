@@ -1224,6 +1224,8 @@ namespace Python.Runtime
             // the C# object is being destroyed which must mean there are no more
             // references to the Python object as well
             var self = GetPyObj(obj);
+            if (self.RawObj == IntPtr.Zero)
+                return;
             Finalizer.Instance.AddDerivedFinalizedObject(ref self.RawObj, self.Run);
         }
 
