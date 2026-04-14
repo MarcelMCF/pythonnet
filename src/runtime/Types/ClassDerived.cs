@@ -255,6 +255,13 @@ namespace Python.Runtime
                     }
                 }
 
+                // Also apply any attributes pushed via @attribute() decorator
+                foreach (PyObject popAttr in PythonDerivedType.PopAttributes())
+                {
+                    var builder = GetAttributeBuilder(popAttr);
+                    typeBuilder.SetCustomAttribute(builder);
+                }
+
                 using var keys = dict.Keys();
                 foreach (PyObject pyKey in keys)
                 {
@@ -514,7 +521,17 @@ namespace Python.Runtime
                 returnType,
                 argTypes.ToArray());
 
-            if (func.HasAttr("__clr_attributes__"))
+            // Check both _clr_attributes_ (set by clr.py decorators) and __clr_attributes__
+            if (func.HasAttr("_clr_attributes_"))
+            {
+                using var attributes = new PyList(func.GetAttr("_clr_attributes_"));
+                foreach (var attr in attributes)
+                {
+                    var builder = GetAttributeBuilder(attr);
+                    methodBuilder.SetCustomAttribute(builder);
+                }
+            }
+            else if (func.HasAttr("__clr_attributes__"))
             {
                 using var attributes = new PyList(func.GetAttr("__clr_attributes__"));
                 foreach (var attr in attributes)
@@ -522,6 +539,17 @@ namespace Python.Runtime
                     var builder = GetAttributeBuilder(attr);
                     methodBuilder.SetCustomAttribute(builder);
                 }
+            }
+
+            // Also apply any attributes associated via @attribute() decorator
+            if (PythonDerivedType.methodAssoc.TryGetValue(func, out List<PyTuple>? assocAttrs))
+            {
+                foreach (PyTuple assocAttr in assocAttrs)
+                {
+                    var builder = GetAttributeBuilder(assocAttr);
+                    methodBuilder.SetCustomAttribute(builder);
+                }
+                PythonDerivedType.methodAssoc.Remove(func);
             }
 
             ILGenerator il = methodBuilder.GetILGenerator();
@@ -611,10 +639,18 @@ namespace Python.Runtime
                                              MethodAttributes.SpecialName;
 
             using var pyPropertyType = func.GetAttr("_clr_property_type_");
-            var propertyType = pyPropertyType.AsManagedObject(typeof(Type)) as Type;
+            using var pyType = new PyType(pyPropertyType);
+            Converter.ToManaged(pyPropertyType, typeof(Type), out object? resolved, setError: false);
+            var propertyType = resolved as Type;
+
+            // Track Python type info for properties that fall back to PyObject
+            string? pyTypeName = null;
+            string? pyTypeModule = null;
             if (propertyType == null)
             {
-                throw new ArgumentException("_clr_property_type must be a CLR type");
+                propertyType = typeof(PyObject);
+                pyTypeModule = pyType.GetAttr("__module__").ToString();
+                pyTypeName = pyType.Name;
             }
 
             PropertyBuilder propertyBuilder = typeBuilder.DefineProperty(propertyName,
@@ -622,7 +658,17 @@ namespace Python.Runtime
                 propertyType,
                 null);
 
-            if (func.HasAttr("__clr_attributes__"))
+            // Check both _clr_attributes_ (set by clr.py decorators) and __clr_attributes__
+            if (func.HasAttr("_clr_attributes_"))
+            {
+                using var attributes = new PyList(func.GetAttr("_clr_attributes_"));
+                foreach (var attr in attributes)
+                {
+                    var builder = GetAttributeBuilder(attr);
+                    propertyBuilder.SetCustomAttribute(builder);
+                }
+            }
+            else if (func.HasAttr("__clr_attributes__"))
             {
                 using var attributes = new PyList(func.GetAttr("__clr_attributes__"));
                 foreach (var attr in attributes)
@@ -630,6 +676,30 @@ namespace Python.Runtime
                     var builder = GetAttributeBuilder(attr);
                     propertyBuilder.SetCustomAttribute(builder);
                 }
+            }
+
+            // Also apply @attribute() decorator attributes associated to the property's fget/fset
+            foreach (string accessor in new[] { "fget", "fset" })
+            {
+                if (!func.HasAttr(accessor)) continue;
+                using var key = func.GetAttr(accessor);
+                if (PythonDerivedType.methodAssoc.TryGetValue(key, out List<PyTuple>? assocAttrs))
+                {
+                    foreach (PyTuple assocAttr in assocAttrs)
+                    {
+                        var builder = GetAttributeBuilder(assocAttr);
+                        propertyBuilder.SetCustomAttribute(builder);
+                    }
+                    PythonDerivedType.methodAssoc.Remove(func);
+                }
+            }
+
+            // Apply PythonTypeAttribute for properties that resolved to PyObject
+            if (pyTypeName != null)
+            {
+                var ctor = typeof(PythonTypeAttribute).GetConstructors().First();
+                var attr = new CustomAttributeBuilder(ctor, new object[] { pyTypeModule!, pyTypeName });
+                propertyBuilder.SetCustomAttribute(attr);
             }
 
             if (func.HasAttr("fget"))
@@ -847,8 +917,66 @@ namespace Python.Runtime
     [Obsolete(Util.InternalUseOnly)]
     public class PythonDerivedType
     {
+        private static List<PyTuple> attributesStack = new List<PyTuple>();
+        internal static Dictionary<PyObject, List<PyTuple>> methodAssoc = new Dictionary<PyObject, List<PyTuple>>();
+
         internal const string PyObjName = "__pyobj__";
         internal const BindingFlags PyObjFlags = BindingFlags.Instance | BindingFlags.NonPublic;
+
+        /// <summary>
+        /// Pushes an attribute tuple onto the attribute stack.
+        /// Called from Python's <c>@attribute()</c> decorator.
+        /// </summary>
+        public static void PushAttribute(PyObject obj)
+        {
+            using (Py.GIL())
+            {
+                PyTuple item = new PyTuple(obj);
+                attributesStack.Add(item);
+            }
+        }
+
+        /// <summary>
+        /// Associates a pushed attribute with a decorated function/property.
+        /// Called from the <c>@attribute()</c> decorator's <c>__call__</c>.
+        /// </summary>
+        public static bool AssocAttribute(PyObject obj, PyObject func)
+        {
+            using (Py.GIL())
+            {
+                PyTuple pyTuple = new PyTuple(obj);
+                for (int i = 0; i < attributesStack.Count; i++)
+                {
+                    if (pyTuple.BorrowNullable() == attributesStack[i].BorrowNullable())
+                    {
+                        attributesStack.RemoveAt(i);
+                        if (!methodAssoc.TryGetValue(func, out List<PyTuple>? value))
+                        {
+                            List<PyTuple> list = (methodAssoc[func] = new List<PyTuple>());
+                            value = list;
+                        }
+                        value.Add(pyTuple);
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Pops all remaining (class-level) attributes from the stack.
+        /// Called during type creation to apply <c>@attribute()</c> decorators to the class.
+        /// </summary>
+        public static IEnumerable<PyObject> PopAttributes()
+        {
+            if (attributesStack.Count == 0)
+            {
+                return Array.Empty<PyObject>();
+            }
+            List<PyTuple> result = attributesStack;
+            attributesStack = new List<PyTuple>();
+            return result;
+        }
 
         /// <summary>
         /// This is the implementation of the overridden methods in the derived

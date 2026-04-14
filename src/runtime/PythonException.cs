@@ -222,7 +222,22 @@ namespace Python.Runtime
 
         private static Exception? TryDecodePyErr(BorrowedReference typeRef, BorrowedReference valRef, BorrowedReference tbRef)
         {
-            using var pyErrType = Runtime.InteropModule.GetAttr("PyErr");
+            // InteropModule is lazily initialized late in Runtime.Initialize().
+            // If an error occurs early (e.g. during MetaType.Initialize), the
+            // module isn't available yet — gracefully return null to let the
+            // caller fall back to standard exception handling.
+            PyObject interop;
+            try
+            {
+                interop = Runtime.InteropModule;
+            }
+            catch
+            {
+                return null;
+            }
+            if (interop is null) return null;
+
+            using var pyErrType = interop.GetAttr("PyErr");
             using var errorDict = ToPyErrArgs(typeRef, valRef, tbRef);
             using var pyErrInfo = pyErrType.Invoke(new PyTuple(), errorDict);
             if (PyObjectConversions.TryDecode(pyErrInfo.Reference, pyErrType.Reference,

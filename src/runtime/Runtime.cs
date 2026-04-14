@@ -364,6 +364,21 @@ namespace Python.Runtime
         public static bool TryCollectingGarbage(int runs)
             => TryCollectingGarbage(runs, forceBreakLoops: false);
 
+        /// <summary>
+        /// Evicts collectable CLR reflected objects from the internal tracking set.
+        /// Objects with Python refcount = 1 (only referenced by the tracking set) have
+        /// their GCHandle freed and are removed. Zombie entries (refcount ≤ 0) are also
+        /// removed. Objects with refcount > 1 (still in use) are left untouched.
+        /// <para>
+        /// Call this periodically in long-running processes to prevent unbounded growth
+        /// of the reflected object set when CLR objects are repeatedly exposed to Python.
+        /// The caller must hold the GIL.
+        /// </para>
+        /// </summary>
+        /// <returns>An <see cref="EvictResult"/> with eviction statistics.</returns>
+        public static EvictResult EvictReflectedObjects()
+            => CLRObject.EvictCollectable();
+
         static void DisposeLazyObject(Lazy<PyObject> pyObject)
         {
             if (pyObject.IsValueCreated)
