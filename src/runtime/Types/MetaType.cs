@@ -1,5 +1,7 @@
 using System;
 using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 
@@ -121,15 +123,33 @@ namespace Python.Runtime
                 return Exceptions.RaiseTypeError("subclasses of managed classes do not support __slots__");
             }
 
-            // If __assembly__ or __namespace__ are in the class dictionary then create
-            // a managed sub type.
+            // If __assembly__ or __namespace__ are in the class dictionary, or the
+            // base type has a parameterless constructor, create a managed sub type.
             // This creates a new managed type that can be used from .net to call back
             // into python.
             if (null != dict)
             {
-                using var clsDict = new PyDict(dict);
-                if (clsDict.HasKey("__assembly__") || clsDict.HasKey("__namespace__"))
+                // Check if the base type has a parameterless constructor — if so,
+                // always create a derived CLR type (matches Keysight behavior).
+                ConstructorInfo? constructorInfo = null;
+                if (GetManagedObject(base_type) is ClassBase cb2 && cb2.type.Valid)
                 {
+                    constructorInfo = cb2.type.Value
+                        .GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                        .FirstOrDefault(x => !x.GetParameters().Any());
+                }
+
+                using var clsDict = new PyDict(dict);
+                if (clsDict.HasKey("__assembly__") || clsDict.HasKey("__namespace__") || constructorInfo != null)
+                {
+                    // Auto-derive __namespace__ from __module__ when not set explicitly.
+                    // This ensures Python types get a proper CLR namespace
+                    // (e.g., "ot_python_package.DelayStep" from __module__).
+                    if (!clsDict.HasKey("__namespace__"))
+                    {
+                        clsDict["__namespace__"] = clsDict["__module__"].ToString()!.ToPython();
+                    }
+
                     return TypeManager.CreateSubType(name, base_type, clsDict);
                 }
             }

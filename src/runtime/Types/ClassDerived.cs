@@ -791,7 +791,29 @@ namespace Python.Runtime
             // in python there is no difference. But luckily there is rarely a conflict, so we can treat
             // named arguments and named properties or fields the same way.
             var tp = new PyTuple(attr);
-            Type attribute = tp[0].As<Type>();
+
+            // Support two formats:
+            // 1. (Type, (args...), {kwargs})  — the standard @attribute(Type, arg1, ...) form
+            // 2. (Instance, (), {})           — pre-constructed attribute: @attribute(Type(arg1, ...))
+            object firstElem = tp[0].AsManagedObject(typeof(object));
+
+            if (firstElem is Attribute attrInstance)
+            {
+                // Pre-constructed attribute instance — reverse-engineer the CustomAttributeBuilder
+                // by matching constructor parameters to the instance's public property values.
+                return BuildAttributeFromInstance(attrInstance);
+            }
+
+            Type attribute;
+            if (firstElem is Type t)
+            {
+                attribute = t;
+            }
+            else
+            {
+                throw new Exception($"Expected an attribute type or instance, got {firstElem?.GetType()}: {firstElem}");
+            }
+
             if (typeof(Attribute).IsAssignableFrom(attribute) == false)
             {
                 throw new Exception($"This type cannot be used as an attribute type: {attribute}");
@@ -900,6 +922,91 @@ namespace Python.Runtime
             }
 
             throw new Exception($"Unable to build an attribute from the supplied arguments: {attribute}");
+        }
+
+        /// <summary>
+        /// Builds a <see cref="CustomAttributeBuilder"/> from a pre-constructed attribute instance
+        /// by using reflection to match the instance's property values to constructor parameters.
+        /// This supports the <c>@attribute(OpenTap.Display("Name", "Desc"))</c> pattern where
+        /// the attribute is already constructed before being passed to the decorator.
+        /// </summary>
+        static CustomAttributeBuilder BuildAttributeFromInstance(Attribute attrInstance)
+        {
+            var type = attrInstance.GetType();
+            var publicProps = type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Where(p => p.CanRead && p.DeclaringType != typeof(Attribute) && p.DeclaringType != typeof(object))
+                .ToDictionary(p => p.Name, p => p, StringComparer.OrdinalIgnoreCase);
+
+            // Try each constructor, preferring the one with the most parameters
+            var constructors = type.GetConstructors()
+                .OrderByDescending(c => c.GetParameters().Length)
+                .ToArray();
+
+            foreach (var ctor in constructors)
+            {
+                var parameters = ctor.GetParameters();
+                var ctorArgs = new object?[parameters.Length];
+                var matched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                bool valid = true;
+
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    var param = parameters[i];
+                    // Match constructor parameter to a public property with the same name
+                    if (publicProps.TryGetValue(param.Name!, out var prop) &&
+                        param.ParameterType.IsAssignableFrom(prop.PropertyType))
+                    {
+                        ctorArgs[i] = prop.GetValue(attrInstance);
+                        matched.Add(param.Name!);
+                    }
+                    else if (param.IsOptional)
+                    {
+                        ctorArgs[i] = param.DefaultValue;
+                    }
+                    else
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+
+                if (!valid) continue;
+
+                // Remaining properties that weren't matched to constructor params → named properties
+                var namedProps = new List<PropertyInfo>();
+                var namedPropValues = new List<object?>();
+                foreach (var kv in publicProps)
+                {
+                    if (matched.Contains(kv.Key)) continue;
+                    if (!kv.Value.CanWrite) continue;
+                    var val = kv.Value.GetValue(attrInstance);
+                    if (val != null && !val.Equals(GetDefaultValue(kv.Value.PropertyType)))
+                    {
+                        namedProps.Add(kv.Value);
+                        namedPropValues.Add(val);
+                    }
+                }
+
+                try
+                {
+                    return new CustomAttributeBuilder(
+                        ctor, ctorArgs,
+                        namedProps.ToArray(), namedPropValues.ToArray());
+                }
+                catch
+                {
+                    // This constructor didn't work, try the next one
+                    continue;
+                }
+            }
+
+            throw new Exception(
+                $"Unable to reconstruct CustomAttributeBuilder from pre-constructed {type.Name} instance");
+        }
+
+        static object? GetDefaultValue(Type type)
+        {
+            return type.IsValueType ? Activator.CreateInstance(type) : null;
         }
     }
 
