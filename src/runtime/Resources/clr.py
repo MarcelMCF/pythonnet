@@ -118,7 +118,7 @@ class clrmethod(object):
 class property(object):
     """
     Property descriptor for exposing simple typed properties to .NET.
-    Unlike clrproperty, this stores values per-instance using a WeakKeyDictionary.
+    Stores values per-instance using id(instance) as the key.
 
     e.g.::
 
@@ -127,25 +127,25 @@ class property(object):
     """
 
     def __init__(self, type, default = None):
-        import weakref
         self._clr_property_type_ = type
         self.default = default
-        self.values = weakref.WeakKeyDictionary()
+        self._id_values = {}
         self._clr_attributes_ = []
         self.fget = 1
         self.fset = 1
 
     def __get__(self, instance, owner):
+        if instance is None:
+            return self
         if self.fget != 1:
             return self.fget(instance)
-        v = self.values.get(instance, self.default)
-        return v
+        return self._id_values.get(id(instance), self.default)
 
     def __set__(self, instance, value):
         if self.fset != 1:
             self.fset(instance, value)
             return
-        self.values[instance] = value
+        self._id_values[id(instance)] = value
 
     def add_attribute(self, *args, **kwargs):
         lst = []

@@ -264,8 +264,10 @@ namespace Python.Runtime
             }
             else
             {
-                Exceptions.RaiseTypeError("unhashable type");
-                return 0;
+                // Fallback for derived types where the CLRObject GCHandle was
+                // weakened (refcount hit 0) and the wrapper was collected by GC.
+                // Use the Python object pointer as hash (same as default object.__hash__).
+                return ob.DangerousGetAddress().GetHashCode();
             }
         }
 

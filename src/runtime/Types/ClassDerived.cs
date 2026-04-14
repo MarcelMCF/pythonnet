@@ -1291,23 +1291,74 @@ namespace Python.Runtime
         public static void InvokeCtor(IPythonDerivedType obj, string origCtorName, object[] args)
         {
             var selfRef = GetPyObj(obj);
-            if (selfRef.Ref == null)
+            bool needsPythonInit = (selfRef.Ref == null);
+
+            if (needsPythonInit)
             {
-                // this might happen when the object is created from .NET
-                using var _ = Py.GIL();
-                // In the end we decrement the python object's reference count.
-                // This doesn't actually destroy the object, it just sets the reference to this object
-                // to be a weak reference and it will be destroyed when the C# object is destroyed.
-                using var self = CLRObject.GetReference(obj, obj.GetType());
-                SetPyObj(obj, self.Borrow());
+                // Object is being created from .NET (e.g., by a serializer).
+                // Create the Python object wrapper and keep it alive.
+                var gilState = Runtime.PyGILState_Ensure();
+                try
+                {
+                    var pyRef = CLRObject.GetReference(obj, obj.GetType());
+                    SetPyObj(obj, pyRef.Borrow());
+                    // Intentionally NOT disposing pyRef here — we need the refcount > 0
+                    // so the GCHandle stays strong until after __init__ runs.
+                    // The reference is stored in __pyobj__ and will be managed by
+                    // ClassDerivedObject.ToPython / tp_dealloc lifecycle.
+                }
+                finally
+                {
+                    Runtime.PyGILState_Release(gilState);
+                }
             }
 
-            // call the base constructor
+            // Call the base constructor (CLR side).
             obj.GetType().InvokeMember(origCtorName,
                 BindingFlags.InvokeMethod,
                 null,
                 obj,
                 args);
+
+            // After the base constructor has run, call Python __init__ so that
+            // Python-side state is initialized (e.g., self.log = Trace(self) in
+            // PyTestStep.__init__). This only runs when the object was created
+            // from .NET — if created from Python, __init__ was already called
+            // by the normal tp_call → tp_init path.
+            if (needsPythonInit)
+            {
+                var gilState = Runtime.PyGILState_Ensure();
+                try
+                {
+                    var pyObjRef = GetPyObj(obj);
+                    using var pyself = new PyObject(pyObjRef.CheckRun());
+                    try
+                    {
+                        using var initFunc = pyself.GetAttr("__init__");
+                        if (initFunc is not null)
+                        {
+                            var pyArgs = new PyObject[args.Length];
+                            for (int i = 0; i < args.Length; i++)
+                            {
+                                pyArgs[i] = Converter.ToPythonImplicit(args[i]).MoveToPyObject();
+                            }
+                            initFunc.Invoke(pyArgs);
+                            foreach (var a in pyArgs) a.Dispose();
+                        }
+                    }
+                    catch
+                    {
+                        // __init__ might fail during .NET-side construction
+                        // (e.g., missing resources). This is non-fatal — the CLR
+                        // object is still usable; Python-side attributes may just
+                        // be uninitialized.
+                    }
+                }
+                finally
+                {
+                    Runtime.PyGILState_Release(gilState);
+                }
+            }
         }
 
         public static void PyFinalize(IPythonDerivedType obj)
