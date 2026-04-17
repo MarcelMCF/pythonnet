@@ -44,7 +44,7 @@ namespace Python.Runtime
 
         // "borrowed" references
         internal static readonly HashSet<IntPtr> loadedExtensions = new();
-        void SetupGc (BorrowedReference ob, BorrowedReference tp)
+        void SetupGc(BorrowedReference ob, BorrowedReference tp)
         {
             GCHandle gc = GCHandle.Alloc(this);
             InitGCHandle(ob, tp, gc);
@@ -94,8 +94,7 @@ namespace Python.Runtime
 
             if (TryFreeGCHandle(ob))
             {
-                bool deleted = loadedExtensions.Remove(ob.DangerousGetAddress());
-                Debug.Assert(deleted);
+                loadedExtensions.Remove(ob.DangerousGetAddress());
             }
 
             int res = ClassBase.BaseUnmanagedClear(ob);

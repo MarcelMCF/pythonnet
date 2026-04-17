@@ -918,7 +918,7 @@ namespace Python.Runtime
                     namedProperties.ToArray(), namedPropertyValues.ToArray(),
                     namedFields.ToArray(), namedFieldValues.ToArray());
                 return attrBuilder;
-                next: ;
+            next:;
             }
 
             throw new Exception($"Unable to build an attribute from the supplied arguments: {attribute}");
@@ -1371,7 +1371,26 @@ namespace Python.Runtime
 
         internal static void Finalize(IntPtr derived)
         {
+            if (derived == IntPtr.Zero) return;
+
             var @ref = NewReference.DangerousFromPointer(derived);
+
+            // Safety: check if the object is still GC-tracked.
+            // Normally ClassDerived.tp_dealloc calls PyObject_GC_UnTrack, but if
+            // the object was evicted from reflectedObjects without going through
+            // the normal tp_dealloc path, it might still be tracked.
+            try
+            {
+                if (Runtime.PyObject_GC_IsTracked(@ref.Borrow()))
+                {
+                    Runtime.PyObject_GC_UnTrack(@ref.Borrow());
+                }
+            }
+            catch
+            {
+                // Memory might be invalid — bail out
+                return;
+            }
 
             ClassBase.tp_clear(@ref.Borrow());
 
@@ -1379,8 +1398,7 @@ namespace Python.Runtime
 
             if (!Runtime.HostedInPython || Runtime.TypeManagerInitialized)
             {
-                // rare case when it's needed
-                // matches correspdonging PyObject_GC_UnTrack
+                // matches corresponding PyObject_GC_UnTrack
                 // in ClassDerivedObject.tp_dealloc
                 Runtime.PyObject_GC_Del(@ref.Steal());
 

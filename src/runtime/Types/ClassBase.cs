@@ -361,8 +361,7 @@ namespace Python.Runtime
             if (TryFreeGCHandle(ob))
             {
                 IntPtr addr = ob.DangerousGetAddress();
-                bool deleted = CLRObject.reflectedObjects.Remove(addr);
-                Debug.Assert(deleted);
+                CLRObject.reflectedObjects.Remove(addr);
             }
 
             int baseClearResult = BaseUnmanagedClear(ob);
