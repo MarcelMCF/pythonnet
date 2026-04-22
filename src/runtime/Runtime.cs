@@ -365,24 +365,35 @@ namespace Python.Runtime
             => TryCollectingGarbage(runs, forceBreakLoops: false);
 
         /// <summary>
-        /// Evicts collectable CLR reflected objects from the internal tracking set.
-        /// Objects with Python refcount = 1 (only referenced by the tracking set) have
-        /// their GCHandle freed and are removed. Zombie entries (refcount ≤ 0) are also
-        /// removed. When <paramref name="maxRefcount"/> is greater than 1, objects with
-        /// higher refcounts are also force-evicted (GCHandle freed, Python wrapper kept alive).
-        /// <para>
-        /// Call this periodically in long-running processes to prevent unbounded growth
-        /// of the reflected object set when CLR objects are repeatedly exposed to Python.
+        /// Current number of entries in the CLR reflected-objects tracking set.
+        /// Useful for diagnostics/monitoring memory behaviour.
         /// The caller must hold the GIL.
-        /// </para>
         /// </summary>
-        /// <param name="maxRefcount">
-        /// Maximum Python refcount threshold for eviction. Default 1 (conservative).
-        /// Use <c>long.MaxValue</c> for aggressive eviction of all tracked objects.
+        public static int ReflectedObjectCount => CLRObject.ReflectedObjectCount;
+
+        /// <summary>
+        /// Diagnostic: distribution of reference counts in the reflected-objects set.
+        /// Must hold GIL.
+        /// </summary>
+        public static (int rc1, int rc2, int rc3plus) DiagnoseRefcounts()
+            => CLRObject.DiagnoseRefcounts();
+
+        /// <summary>
+        /// Evicts phantom references from the reflected-objects set.
+        /// <para>
+        /// Handles two categories: Python-created phantoms (<c>addr != __pyobj__</c>,
+        /// always safe) and .NET-created phantoms (<c>addr == __pyobj__</c>, safe only
+        /// when <paramref name="isAbandoned"/> confirms the object is no longer in use).
+        /// </para>
+        /// <para><b>Must hold GIL.</b></para>
+        /// </summary>
+        /// <param name="isAbandoned">
+        /// For .NET-created phantoms, return <c>true</c> to allow eviction.
+        /// If <c>null</c>, only Python-created phantoms are evicted.
         /// </param>
-        /// <returns>An <see cref="EvictResult"/> with eviction statistics.</returns>
-        public static EvictResult EvictReflectedObjects(long maxRefcount = 1)
-            => CLRObject.EvictCollectable(maxRefcount);
+        /// <returns>Number of phantom references released.</returns>
+        public static int EvictAbandonedObjects(Func<object, bool>? isAbandoned = null)
+            => CLRObject.EvictAbandonedObjects(isAbandoned);
 
         static void DisposeLazyObject(Lazy<PyObject> pyObject)
         {

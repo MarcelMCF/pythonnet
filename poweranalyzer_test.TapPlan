@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TestPlan type="OpenTap.TestPlan">
+  <Steps>
+    <TestStep type="PythonExamples.ChargeStep.ChargeStep">
+      <Voltage>3.6</Voltage>
+      <Current>1</Current>
+      <TargetCellVoltageMargin>0.5</TargetCellVoltageMargin>
+      <MeasurementInterval>0.5</MeasurementInterval>
+      <PowerAnalyzer Source="BenchSettings">PyPowerAnalyzer</PowerAnalyzer>
+      <Enabled>true</Enabled>
+    </TestStep>
+  </Steps>
+</TestPlan>

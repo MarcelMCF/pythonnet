@@ -374,7 +374,7 @@ namespace Python.Runtime
             return new PyTuple(bases);
         }
 
-        internal static NewReference CreateSubType(BorrowedReference py_name, BorrowedReference py_base_type, BorrowedReference dictRef)
+        internal static NewReference CreateSubType(BorrowedReference py_name, BorrowedReference py_base_type, BorrowedReference dictRef, Type[]? extraInterfaces = null)
         {
             // Utility to create a subtype of a managed type with the ability for the
             // a python subtype able to override the managed implementation
@@ -420,7 +420,8 @@ namespace Python.Runtime
                 return ReflectedClrType.CreateSubclass(baseClass, name,
                                                        ns: (string?)namespaceStr,
                                                        assembly: (string?)assembly,
-                                                       dict: dictRef);
+                                                       dict: dictRef,
+                                                       extraInterfaces: extraInterfaces);
             }
             else
             {

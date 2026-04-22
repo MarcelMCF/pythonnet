@@ -1,41 +1,212 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 namespace Python.Runtime
 {
-    /// <summary>
-    /// Result of a <see cref="CLRObject.EvictCollectable"/> call.
-    /// </summary>
-    public readonly struct EvictResult
-    {
-        /// <summary>Number of entries with refcount ≤ 1 that were evicted and had their GCHandle freed.</summary>
-        public int EvictedRc1 { get; init; }
-        /// <summary>Number of entries with refcount &gt; 1 that were force-evicted (GCHandle freed, Python wrapper kept alive).</summary>
-        public int EvictedAlive { get; init; }
-        /// <summary>Number of entries with refcount ≤ 0 (zombies) that were evicted.</summary>
-        public int EvictedZombies { get; init; }
-        /// <summary>Number of entries that caused an access violation and were evicted.</summary>
-        public int EvictedInvalid { get; init; }
-        /// <summary>Number of entries that are still alive (refcount &gt; maxRefcount) and were left untouched.</summary>
-        public int Alive { get; init; }
-        /// <summary>Total entries in reflectedObjects before eviction.</summary>
-        public int TotalBefore { get; init; }
-        /// <summary>Total entries in reflectedObjects after eviction.</summary>
-        public int TotalAfter { get; init; }
-        /// <summary>Total number of evicted entries.</summary>
-        public int TotalEvicted => EvictedRc1 + EvictedAlive + EvictedZombies + EvictedInvalid;
-    }
-
     [Serializable]
     [DebuggerDisplay("clrO: {inst}")]
     internal sealed class CLRObject : ManagedType
     {
         internal readonly object inst;
 
-        // "borrowed" references
+        // "borrowed" references — tracks all Python wrappers for CLR objects.
+        // Entries are added in Create/OnLoad and removed by:
+        //   • ClassBase.tp_clear        (regular CLR wrappers, called from tp_dealloc)
+        //   • ClassDerivedObject.tp_dealloc (Python-derived types, handle weakened)
+        //   • PythonDerivedType.Finalize    (Python-derived types, final cleanup)
+        // ClassDerivedObject.ToPython re-adds entries when a deallocated wrapper
+        // is resurrected with a strong GCHandle.
         internal static readonly HashSet<IntPtr> reflectedObjects = new();
+
+        /// <summary>
+        /// Current number of entries in the reflected-objects tracking set.
+        /// Useful for diagnostics/monitoring memory behaviour.
+        /// </summary>
+        public static int ReflectedObjectCount => reflectedObjects.Count;
+
+        /// <summary>
+        /// Diagnostic: counts how many entries in reflectedObjects have each
+        /// refcount value (1, 2, 3+).  Must hold GIL.
+        /// </summary>
+        internal static (int rc1, int rc2, int rc3plus) DiagnoseRefcounts()
+        {
+            int rc1 = 0, rc2 = 0, rc3plus = 0;
+            foreach (var addr in reflectedObjects)
+            {
+                if (addr == IntPtr.Zero) continue;
+                try
+                {
+                    var borrowed = new BorrowedReference(addr);
+                    var rc = Runtime.Refcount(borrowed);
+                    if (rc == 1) rc1++;
+                    else if (rc == 2) rc2++;
+                    else rc3plus++;
+                }
+                catch { }
+            }
+            return (rc1, rc2, rc3plus);
+        }
+
+        /// <summary>
+        /// Scans the reflected-objects set for Python wrappers that are phantom
+        /// references from <c>InvokeCtor</c> and can be safely released.
+        /// <para>
+        /// Three categories are handled:
+        /// </para>
+        /// <list type="number">
+        ///   <item><b>Python-created phantoms</b> (<c>addr != __pyobj__</c>):
+        ///     Orphaned wrappers from <c>InvokeCtor</c> that Python never uses.
+        ///     Always safe to release (any refcount).</item>
+        ///   <item><b>.NET-created owned wrappers</b> (<c>addr == __pyobj__</c>):
+        ///     The primary wrapper for .NET-created PythonDerived instances.
+        ///     Before releasing: <c>__dict__</c> is cleared (breaks cycles to
+        ///     Trace wrappers etc.), then <c>__pyobj__</c> is zeroed, then the
+        ///     phantom is released. Only evicted when <paramref name="isAbandoned"/>
+        ///     confirms the object is no longer in use.</item>
+        ///   <item><b>Stale CLR wrappers</b> (rc == 1, non-PythonDerived):
+        ///     Regular CLR wrappers (e.g. TraceSource, LogEventType) that were
+        ///     referenced from an evicted wrapper's <c>__dict__</c>. After the
+        ///     dict-clearing cascade in category 2, these drop to rc = 1 and
+        ///     can be safely released.</item>
+        /// </list>
+        /// <para><b>Must be called with the Python GIL held.</b></para>
+        /// </summary>
+        /// <param name="isAbandoned">
+        /// Optional callback for .NET-created PythonDerived entries.
+        /// Return <c>true</c> to allow eviction.
+        /// If <c>null</c>, only Python-created phantoms are evicted.
+        /// </param>
+        /// <returns>Number of entries released.</returns>
+        internal static int EvictAbandonedObjects(Func<object, bool>? isAbandoned = null)
+        {
+            int count = reflectedObjects.Count;
+            if (count == 0) return 0;
+
+            IntPtr[] snapshot = new IntPtr[count];
+            reflectedObjects.CopyTo(snapshot);
+
+            int released = 0;
+
+            // Record which entries are already at rc=1 BEFORE eviction.
+            // Pass 2 must not touch these — they belong to still-alive objects.
+            var preEvictRc1 = new HashSet<IntPtr>();
+            foreach (var addr in snapshot)
+            {
+                if (addr == IntPtr.Zero) continue;
+                try
+                {
+                    if (Runtime.Refcount(new BorrowedReference(addr)) == 1)
+                        preEvictRc1.Add(addr);
+                }
+                catch { }
+            }
+
+            // ── Pass 1: Evict PythonDerived phantoms and owned wrappers ────
+            // These may have rc > 1 due to __dict__ cross-references.
+            // Clearing __dict__ first breaks cycles; then Py_DecRef releases
+            // the phantom ref.  Cascade: tp_dealloc on freed wrappers reduces
+            // rc on their dependents, leaving stale CLR wrappers at rc = 1
+            // for Pass 2.
+            foreach (var addr in snapshot)
+            {
+                if (addr == IntPtr.Zero) continue;
+                if (!reflectedObjects.Contains(addr)) continue; // already freed by cascade
+
+                try
+                {
+                    var borrowed = new BorrowedReference(addr);
+
+                    GCHandle? handle = ManagedType.TryGetGCHandle(borrowed);
+                    if (handle is null || !handle.Value.IsAllocated) continue;
+                    if (handle.Value.Target is not CLRObject clrObj) continue;
+
+                    object inst = clrObj.inst;
+                    if (inst is not IPythonDerivedType derived) continue;
+
+                    // Read __pyobj__ to classify the entry.
+                    IntPtr pyObjAddr;
+                    try { pyObjAddr = PythonDerivedType.GetPyObj(derived).RawObj; }
+                    catch { continue; }
+
+                    bool isPythonCreatedPhantom =
+                        pyObjAddr != IntPtr.Zero && pyObjAddr != addr;
+
+                    if (isPythonCreatedPhantom)
+                    {
+                        // Always safe — nobody uses this wrapper.
+                        ClearDict(borrowed);
+                        reflectedObjects.Remove(addr);
+                        Runtime.XDecref(StolenReference.DangerousFromPointer(addr));
+                        released++;
+                    }
+                    else if (isAbandoned != null && isAbandoned(inst))
+                    {
+                        // Owned wrapper for an abandoned .NET object.
+                        // Clear __dict__ to cascade-free contained wrappers.
+                        ClearDict(borrowed);
+                        PythonDerivedType.SetPyObj(derived,
+                            new BorrowedReference(IntPtr.Zero));
+                        reflectedObjects.Remove(addr);
+                        Runtime.XDecref(StolenReference.DangerousFromPointer(addr));
+                        released++;
+                    }
+                }
+                catch { /* skip corrupt entries */ }
+            }
+
+            // ── Pass 2: Sweep stale CLR wrappers now at rc = 1 ─────────
+            // After Pass 1 cleared __dict__ on PythonDerived wrappers, their
+            // contained CLR wrappers (TraceSource, enum values, etc.) may
+            // have dropped to rc = 1.  Only release entries that were NOT
+            // already rc = 1 before eviction (those are from still-alive objects).
+            if (released > 0)
+            {
+                count = reflectedObjects.Count;
+                snapshot = new IntPtr[count];
+                reflectedObjects.CopyTo(snapshot);
+
+                foreach (var addr in snapshot)
+                {
+                    if (addr == IntPtr.Zero) continue;
+                    if (preEvictRc1.Contains(addr)) continue; // pre-existing, don't touch
+                    try
+                    {
+                        var borrowed = new BorrowedReference(addr);
+                        if (Runtime.Refcount(borrowed) != 1) continue;
+
+                        reflectedObjects.Remove(addr);
+                        Runtime.XDecref(StolenReference.DangerousFromPointer(addr));
+                        released++;
+                    }
+                    catch { /* skip */ }
+                }
+            }
+
+            return released;
+        }
+
+        /// <summary>
+        /// Clears the Python <c>__dict__</c> on <paramref name="ob"/> to
+        /// release any contained references before the wrapper is freed.
+        /// </summary>
+        private static void ClearDict(BorrowedReference ob)
+        {
+            try
+            {
+                using var dict = Runtime.PyObject_GenericGetDict(ob);
+                if (!dict.IsNull())
+                {
+                    Runtime.PyDict_Clear(dict.Borrow());
+                }
+            }
+            catch
+            {
+                // Dict may not exist for this type — ignore.
+            }
+        }
 
         static NewReference Create(object ob, BorrowedReference tp)
         {
@@ -61,6 +232,14 @@ namespace Python.Runtime
         {
             this.inst = inst;
         }
+
+        /// <summary>
+        /// Creates a new <see cref="CLRObject"/> wrapping <paramref name="inst"/>
+        /// without allocating a new Python object or registering in
+        /// <see cref="reflectedObjects"/>. Used by <c>ToPython</c> resurrection
+        /// when the previous CLRObject was collected while its GCHandle was Weak.
+        /// </summary>
+        internal static CLRObject CreateWrapper(object inst) => new CLRObject(inst);
 
         internal static NewReference GetReference(object ob, BorrowedReference pyType)
             => Create(ob, pyType);
@@ -91,199 +270,6 @@ namespace Python.Runtime
 
             bool isNew = reflectedObjects.Add(ob.DangerousGetAddress());
             Debug.Assert(isNew);
-        }
-
-        /// <summary>
-        /// Evicts collectable entries from <see cref="reflectedObjects"/>.
-        /// <para>
-        /// Entries with Python refcount ≤ 1 are only referenced by this tracking set.
-        /// Their GCHandle is freed (releasing the pinned .NET object), and they are removed
-        /// from the set. Entries with refcount ≤ 0 (zombies from previous frees) are also
-        /// removed.
-        /// </para>
-        /// <para>
-        /// When <paramref name="maxRefcount"/> is greater than 1, entries with refcount &gt; 1
-        /// are handled based on their managed object type:
-        /// <list type="bullet">
-        ///   <item><b>Python-derived instances</b> (<see cref="IPythonDerivedType"/>): A single
-        ///   <c>Py_DecRef</c> is called to release the phantom reference leaked by
-        ///   <c>ClassDerived.InvokeCtor</c>. Since Entry refcount was &gt; 1, after DecRef
-        ///   it stays ≥ 1 — the Python object survives, <c>tp_dealloc</c> does not fire,
-        ///   and the GCHandle remains Strong. The <c>__pyobj__</c> field is intentionally
-        ///   left intact so the .NET step can still access its Python backing object
-        ///   (required when a test plan is reused across multiple runs, e.g. Session 2).
-        ///   Normal finalization (<c>PyFinalize</c> → <c>PyObject_GC_Del</c>) will clean up
-        ///   when the .NET step is eventually GC'd.</item>
-        ///   <item><b>Infrastructure objects</b> (ExtensionType, MethodObject, type wrappers):
-        ///   Removed from the tracking set <b>without touching their GCHandle or refcount</b>.
-        ///   These are reused by Python's type system across runs — touching them causes access
-        ///   violations.</item>
-        /// </list>
-        /// </para>
-        /// <para>
-        /// <b>Important:</b> The caller must hold the GIL.
-        /// </para>
-        /// </summary>
-        /// <param name="maxRefcount">
-        /// Maximum Python refcount threshold for eviction. Objects with refcount ≤ 1 have
-        /// their GCHandle freed. Objects with 1 &lt; refcount ≤ maxRefcount are processed
-        /// based on type (Py_DecRef for PythonDerived, untrack-only for infrastructure).
-        /// Default is 1 (conservative: only evicts objects not in active use).
-        /// </param>
-        /// <returns>An <see cref="EvictResult"/> with eviction statistics.</returns>
-        public static EvictResult EvictCollectable(long maxRefcount = 1)
-        {
-            int evictedRc1 = 0, evictedAlive = 0, evictedZombies = 0, evictedInvalid = 0, alive = 0;
-            int totalBefore = reflectedObjects.Count;
-
-            // Trigger Python's cyclic GC to break reference cycles and potentially
-            // reduce refcounts before we classify objects.
-            try { Runtime.PyGC_Collect(); } catch { /* best-effort */ }
-
-            var snapshot = new IntPtr[reflectedObjects.Count];
-            reflectedObjects.CopyTo(snapshot);
-
-            var toFreeGCHandle = new List<IntPtr>();   // rc ≤ 1: free GCHandle directly
-            var toDecref = new List<IntPtr>();          // rc > 1 + PythonDerived: Py_DecRef phantom ref
-            var toUntrack = new List<IntPtr>();         // rc > 1 + infrastructure: remove from set only
-
-            // Pass 1: classify by refcount and managed object type (read-only)
-            foreach (var ptr in snapshot)
-            {
-                if (ptr == IntPtr.Zero) { toFreeGCHandle.Add(ptr); evictedInvalid++; continue; }
-
-                try
-                {
-                    var borrowed = new BorrowedReference(ptr);
-                    nint refcount = Runtime.Refcount(borrowed);
-
-                    if (refcount <= 0)
-                    {
-                        evictedZombies++;
-                        toFreeGCHandle.Add(ptr);
-                    }
-                    else if (refcount == 1)
-                    {
-                        evictedRc1++;
-                        toFreeGCHandle.Add(ptr);
-                    }
-                    else if (refcount <= maxRefcount)
-                    {
-                        // rc > 1: check if this is a PythonDerived instance (step) or
-                        // infrastructure (type wrapper, method descriptor, etc.).
-                        bool isPythonDerived = false;
-                        try
-                        {
-                            var gcHandle = TryGetGCHandle(borrowed);
-                            if (gcHandle is { IsAllocated: true })
-                            {
-                                var target = gcHandle.Value.Target;
-                                if (target is CLRObject clrObj && clrObj.inst is IPythonDerivedType)
-                                {
-                                    isPythonDerived = true;
-                                }
-                            }
-                        }
-                        catch
-                        {
-                            // GCHandle access failed — treat as infrastructure (safe path)
-                        }
-
-                        if (isPythonDerived)
-                        {
-                            // PythonDerived step instance: release the phantom reference
-                            // from InvokeCtor. ClassDerived.tp_dealloc (if rc→0) safely
-                            // downgrades the GCHandle to Weak without freeing Python memory.
-                            evictedAlive++;
-                            toDecref.Add(ptr);
-                        }
-                        else
-                        {
-                            // Infrastructure object: just untrack. Touching GCHandle or
-                            // refcount of ExtensionType/MethodObject/etc. causes crashes.
-                            evictedAlive++;
-                            toUntrack.Add(ptr);
-                        }
-                    }
-                    else
-                    {
-                        alive++;
-                    }
-                }
-                catch
-                {
-                    // Pointer is no longer valid
-                    evictedInvalid++;
-                    toFreeGCHandle.Add(ptr);
-                }
-            }
-
-            // Pass 2a: free GCHandles for rc ≤ 1 objects and remove from tracking set
-            foreach (var ptr in toFreeGCHandle)
-            {
-                if (ptr != IntPtr.Zero)
-                {
-                    try
-                    {
-                        var borrowed = new BorrowedReference(ptr);
-                        TryFreeGCHandle(borrowed);
-                    }
-                    catch
-                    {
-                        // Best-effort — pointer may be stale
-                    }
-                }
-                reflectedObjects.Remove(ptr);
-            }
-
-            // Pass 2b: Py_DecRef for PythonDerived step instances.
-            // This releases the phantom reference leaked by InvokeCtor:
-            //   var pyRef = CLRObject.GetReference(obj, type);  // rc = 1
-            //   SetPyObj(obj, pyRef.Borrow());
-            //   // pyRef never disposed — phantom ref leaked
-            //
-            // Since these entries had refcount > 1 at classification time, after
-            // Py_DecRef the refcount stays ≥ 1 — the Python object survives and
-            // tp_dealloc does NOT fire. The GCHandle remains Strong, so .NET GC
-            // cannot collect the step prematurely.
-            //
-            // We intentionally do NOT null __pyobj__: the .NET step's Python backing
-            // object is still alive (rc ≥ 1), and nulling would break any subsequent
-            // property access — e.g. when Session 2 reuses the same test plan across
-            // multiple runs. Normal finalization (PyFinalize → PyObject_GC_Del) will
-            // clean up when the step is eventually GC'd.
-            foreach (var ptr in toDecref)
-            {
-                try
-                {
-                    reflectedObjects.Remove(ptr);
-                    Runtime.Py_DecRef(StolenReference.DangerousFromPointer(ptr));
-                }
-                catch
-                {
-                    // Best-effort — Py_DecRef may trigger complex chains
-                    reflectedObjects.Remove(ptr);
-                }
-            }
-
-            // Pass 2c: remove infrastructure objects from tracking set only.
-            // GCHandle and refcount are left untouched — these objects are managed
-            // by Python's type system and will be cleaned up at shutdown.
-            foreach (var ptr in toUntrack)
-            {
-                reflectedObjects.Remove(ptr);
-            }
-
-            return new EvictResult
-            {
-                EvictedRc1 = evictedRc1,
-                EvictedAlive = evictedAlive,
-                EvictedZombies = evictedZombies,
-                EvictedInvalid = evictedInvalid,
-                Alive = alive,
-                TotalBefore = totalBefore,
-                TotalAfter = reflectedObjects.Count,
-            };
         }
 
     }

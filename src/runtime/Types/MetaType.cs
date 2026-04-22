@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
@@ -81,17 +82,46 @@ namespace Python.Runtime
             BorrowedReference bases = Runtime.PyTuple_GetItem(args, 1);
             BorrowedReference dict = Runtime.PyTuple_GetItem(args, 2);
 
-            // We do not support multiple inheritance, so the bases argument
-            // should be a 1-item tuple containing the type we are subtyping.
-            // That type must itself have a managed implementation. We check
-            // that by making sure its metatype is the CLR metatype.
+            // Multiple inheritance is allowed when all bases are CLR interfaces.
+            // Otherwise the bases argument should be a 1-item tuple containing
+            // the single type we are subtyping.
 
-            if (Runtime.PyTuple_Size(bases) != 1)
+            nint basesCount = Runtime.PyTuple_Size(bases);
+            BorrowedReference base_type;
+            Type[] extraInterfaces = Array.Empty<Type>();
+
+            if (basesCount > 1)
             {
-                return Exceptions.RaiseTypeError("cannot use multiple inheritance with managed classes");
+                var managedInterfaces = new List<Type>();
+                for (nint i = 0; i < basesCount; i++)
+                {
+                    var b = Runtime.PyTuple_GetItem(bases, i);
+                    var bmt = Runtime.PyObject_TYPE(b);
+                    if (!(bmt == PyCLRMetaType || bmt == Runtime.PyTypeType))
+                    {
+                        return Exceptions.RaiseTypeError("invalid metatype");
+                    }
+                    if (GetManagedObject(b) is ClassBase bcb && bcb.type.Valid && bcb.type.Value.IsInterface)
+                    {
+                        managedInterfaces.Add(bcb.type.Value);
+                    }
+                    else
+                    {
+                        return Exceptions.RaiseTypeError("cannot use multiple inheritance with managed classes");
+                    }
+                }
+                // Use the first interface as the primary base type
+                base_type = Runtime.PyTuple_GetItem(bases, 0);
+                if (managedInterfaces.Count > 1)
+                {
+                    extraInterfaces = managedInterfaces.Skip(1).ToArray();
+                }
+            }
+            else
+            {
+                base_type = Runtime.PyTuple_GetItem(bases, 0);
             }
 
-            BorrowedReference base_type = Runtime.PyTuple_GetItem(bases, 0);
             BorrowedReference mt = Runtime.PyObject_TYPE(base_type);
 
             if (!(mt == PyCLRMetaType || mt == Runtime.PyTypeType))
@@ -140,17 +170,17 @@ namespace Python.Runtime
                 }
 
                 using var clsDict = new PyDict(dict);
-                if (clsDict.HasKey("__assembly__") || clsDict.HasKey("__namespace__") || constructorInfo != null)
+                if (clsDict.HasKey("__assembly__") || clsDict.HasKey("__namespace__") || constructorInfo != null
+                    || extraInterfaces.Length > 0)
                 {
                     // Auto-derive __namespace__ from __module__ when not set explicitly.
                     // This ensures Python types get a proper CLR namespace
-                    // (e.g., "ot_python_package.DelayStep" from __module__).
                     if (!clsDict.HasKey("__namespace__"))
                     {
                         clsDict["__namespace__"] = clsDict["__module__"].ToString()!.ToPython();
                     }
 
-                    return TypeManager.CreateSubType(name, base_type, clsDict);
+                    return TypeManager.CreateSubType(name, base_type, clsDict, extraInterfaces);
                 }
             }
 

@@ -108,7 +108,7 @@ namespace Python.Runtime
             {
                 self = GetPyObj(obj).CheckRun();
             }
-            catch (RuntimeShutdownException e)
+            catch (Exception e) when (e is RuntimeShutdownException or InvalidOperationException or ArgumentNullException)
             {
                 Exceptions.SetError(e);
                 return default;
@@ -147,7 +147,8 @@ namespace Python.Runtime
             BorrowedReference py_dict,
             string? namespaceStr,
             string? assemblyName,
-            string moduleName = "Python.Runtime.Dynamic.dll")
+            string moduleName = "Python.Runtime.Dynamic.dll",
+            Type[]? extraInterfaces = null)
         {
             // TODO: clean up
             if (null != namespaceStr)
@@ -171,6 +172,12 @@ namespace Python.Runtime
             {
                 interfaces.Add(baseType);
                 baseClass = typeof(object);
+            }
+
+            // add any extra interfaces (from multiple inheritance of CLR interfaces)
+            if (extraInterfaces is not null)
+            {
+                interfaces.AddRange(extraInterfaces);
             }
 
             TypeBuilder typeBuilder = moduleBuilder.DefineType(name,
@@ -215,12 +222,28 @@ namespace Python.Runtime
             }
 
             // override any virtual methods not already overridden by the properties above
-            MethodInfo[] methods = baseType.GetMethods();
+            // Collect methods from the base type and any extra interfaces
+            var allMethods = new List<MethodInfo>(baseType.GetMethods());
+            if (extraInterfaces is not null)
+            {
+                foreach (var iface in extraInterfaces)
+                {
+                    allMethods.AddRange(iface.GetMethods());
+                }
+            }
+
             var virtualMethods = new HashSet<string>();
-            foreach (MethodInfo method in methods)
+            foreach (MethodInfo method in allMethods)
             {
                 if (!method.Attributes.HasFlag(MethodAttributes.Virtual) |
                     method.Attributes.HasFlag(MethodAttributes.Final))
+                {
+                    continue;
+                }
+
+                // Skip generic method definitions: emitting a non-generic override of a
+                // generic virtual method with unresolved type parameters produces invalid IL.
+                if (method.IsGenericMethodDefinition)
                 {
                     continue;
                 }
@@ -1086,6 +1109,29 @@ namespace Python.Runtime
         }
 
         /// <summary>
+        /// Per-thread set of (instance, methodName) pairs currently being dispatched
+        /// from <see cref="InvokeMethod{T}"/> / <see cref="InvokeMethodVoid"/>.
+        ///
+        /// When a Python override calls <c>super().Method()</c>, that call resolves to
+        /// the IL stub on the dynamically-generated derived type, which in turn calls
+        /// back into <c>InvokeMethod*</c>. Without this guard the dispatcher finds the
+        /// Python override again and recurses until the stack overflows.
+        /// We use the guard to detect re-entry for the same instance + method on the
+        /// same thread, and fall through directly to the C# base method instead
+        /// (which is what <c>super()</c> is supposed to do).
+        /// </summary>
+        [ThreadStatic]
+        private static HashSet<(IntPtr, string)>? s_dispatching;
+
+        private static IntPtr GetDispatchKey(IPythonDerivedType obj)
+        {
+            // Use the runtime object handle as the per-instance key. RuntimeHelpers
+            // is GC-aware (the value stays stable for the object's lifetime) and does
+            // not allocate.
+            return (IntPtr)System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
+        }
+
+        /// <summary>
         /// This is the implementation of the overridden methods in the derived
         /// type. It looks for a python method with the same name as the method
         /// on the managed base class and if it exists and isn't the managed
@@ -1097,114 +1143,161 @@ namespace Python.Runtime
         {
             var self = GetPyObj(obj);
 
-            if (null != self.Ref)
-            {
-                var disposeList = new List<PyObject>();
-                PyGILState gs = Runtime.PyGILState_Ensure();
-                try
-                {
-                    using var pyself = new PyObject(self.CheckRun());
-                    using PyObject method = pyself.GetAttr(methodName, Runtime.None);
-                    if (method.Reference != Runtime.PyNone)
-                    {
-                        // if the method hasn't been overridden then it will be a managed object
-                        ManagedType? managedMethod = ManagedType.GetManagedObject(method.Reference);
-                        if (null == managedMethod)
-                        {
-                            var pyargs = new PyObject[args.Length];
-                            for (var i = 0; i < args.Length; ++i)
-                            {
-                                pyargs[i] = Converter.ToPythonImplicit(args[i]).MoveToPyObject();
-                                disposeList.Add(pyargs[i]);
-                            }
+            // Re-entry guard: see s_dispatching docs above.
+            var dispatchKey = (GetDispatchKey(obj), methodName);
+            s_dispatching ??= new HashSet<(IntPtr, string)>();
+            bool acquired = s_dispatching.Add(dispatchKey);
 
-                            PyObject py_result = method.Invoke(pyargs);
-                            var clrMethod = methodHandle != default
-                                ? MethodBase.GetMethodFromHandle(methodHandle, declaringTypeHandle)
-                                : null;
-                            PyTuple? result_tuple = MarshalByRefsBack(args, clrMethod, py_result, outsOffset: 1);
-                            return result_tuple is not null
-                                ? result_tuple[0].As<T>()
-                                : py_result.As<T>();
+            try
+            {
+                if (acquired && null != self.Ref)
+                {
+                    var disposeList = new List<PyObject>();
+                    PyGILState gs = Runtime.PyGILState_Ensure();
+                    try
+                    {
+                        using var pyself = new PyObject(self.CheckRun());
+                        using PyObject method = pyself.GetAttr(methodName, Runtime.None);
+                        if (method.Reference != Runtime.PyNone)
+                        {
+                            // if the method hasn't been overridden then it will be a managed object
+                            ManagedType? managedMethod = ManagedType.GetManagedObject(method.Reference);
+                            if (null == managedMethod)
+                            {
+                                var pyargs = new PyObject[args.Length];
+                                for (var i = 0; i < args.Length; ++i)
+                                {
+                                    pyargs[i] = Converter.ToPythonImplicit(args[i]).MoveToPyObject();
+                                    disposeList.Add(pyargs[i]);
+                                }
+
+                                PyObject py_result = method.Invoke(pyargs);
+                                var clrMethod = methodHandle != default
+                                    ? MethodBase.GetMethodFromHandle(methodHandle, declaringTypeHandle)
+                                    : null;
+                                PyTuple? result_tuple = MarshalByRefsBack(args, clrMethod, py_result, outsOffset: 1);
+                                return result_tuple is not null
+                                    ? result_tuple[0].As<T>()
+                                    : py_result.As<T>();
+                            }
                         }
                     }
-                }
-                finally
-                {
-                    foreach (PyObject x in disposeList)
+                    finally
                     {
-                        x?.Dispose();
+                        foreach (PyObject x in disposeList)
+                        {
+                            x?.Dispose();
+                        }
+                        Runtime.PyGILState_Release(gs);
                     }
-                    Runtime.PyGILState_Release(gs);
+                }
+
+                if (origMethodName == null)
+                {
+                    throw new NotImplementedException("Python object does not have a '" + methodName + "' method");
+                }
+
+                return (T)obj.GetType().InvokeMember(origMethodName,
+                    BindingFlags.InvokeMethod,
+                    null,
+                    obj,
+                    args);
+            }
+            finally
+            {
+                if (acquired)
+                {
+                    s_dispatching.Remove(dispatchKey);
                 }
             }
-
-            if (origMethodName == null)
-            {
-                throw new NotImplementedException("Python object does not have a '" + methodName + "' method");
-            }
-
-            return (T)obj.GetType().InvokeMember(origMethodName,
-                BindingFlags.InvokeMethod,
-                null,
-                obj,
-                args);
         }
 
         public static void InvokeMethodVoid(IPythonDerivedType obj, string methodName, string origMethodName,
             object?[] args, RuntimeMethodHandle methodHandle, RuntimeTypeHandle declaringTypeHandle)
         {
             var self = GetPyObj(obj);
-            if (null != self.Ref)
-            {
-                var disposeList = new List<PyObject>();
-                PyGILState gs = Runtime.PyGILState_Ensure();
-                try
-                {
-                    using var pyself = new PyObject(self.CheckRun());
-                    using PyObject method = pyself.GetAttr(methodName, Runtime.None);
-                    if (method.Reference != Runtime.None)
-                    {
-                        // if the method hasn't been overridden then it will be a managed object
-                        ManagedType? managedMethod = ManagedType.GetManagedObject(method);
-                        if (null == managedMethod)
-                        {
-                            var pyargs = new PyObject[args.Length];
-                            for (var i = 0; i < args.Length; ++i)
-                            {
-                                pyargs[i] = Converter.ToPythonImplicit(args[i]).MoveToPyObject();
-                                disposeList.Add(pyargs[i]);
-                            }
 
-                            PyObject py_result = method.Invoke(pyargs);
-                            var clrMethod = methodHandle != default
-                                ? MethodBase.GetMethodFromHandle(methodHandle, declaringTypeHandle)
-                                : null;
-                            MarshalByRefsBack(args, clrMethod, py_result, outsOffset: 0);
-                            return;
+            // Re-entry guard: see s_dispatching docs above.
+            var dispatchKey = (GetDispatchKey(obj), methodName);
+            s_dispatching ??= new HashSet<(IntPtr, string)>();
+            bool acquired = s_dispatching.Add(dispatchKey);
+
+            try
+            {
+                if (!acquired)
+                {
+                    // Already dispatching this (instance, method) on this thread.
+                    // This is a super().Method() call from inside the Python override;
+                    // route it to the C# base method instead of recursing.
+                    if (origMethodName == null)
+                    {
+                        throw new NotImplementedException($"Python object does not have a '{methodName}' method");
+                    }
+                    obj.GetType().InvokeMember(origMethodName,
+                        BindingFlags.InvokeMethod,
+                        null,
+                        obj,
+                        args);
+                    return;
+                }
+                if (null != self.Ref)
+                {
+                    var disposeList = new List<PyObject>();
+                    PyGILState gs = Runtime.PyGILState_Ensure();
+                    try
+                    {
+                        using var pyself = new PyObject(self.CheckRun());
+                        using PyObject method = pyself.GetAttr(methodName, Runtime.None);
+                        if (method.Reference != Runtime.None)
+                        {
+                            // if the method hasn't been overridden then it will be a managed object
+                            ManagedType? managedMethod = ManagedType.GetManagedObject(method);
+                            if (null == managedMethod)
+                            {
+                                var pyargs = new PyObject[args.Length];
+                                for (var i = 0; i < args.Length; ++i)
+                                {
+                                    pyargs[i] = Converter.ToPythonImplicit(args[i]).MoveToPyObject();
+                                    disposeList.Add(pyargs[i]);
+                                }
+
+                                PyObject py_result = method.Invoke(pyargs);
+                                var clrMethod = methodHandle != default
+                                    ? MethodBase.GetMethodFromHandle(methodHandle, declaringTypeHandle)
+                                    : null;
+                                MarshalByRefsBack(args, clrMethod, py_result, outsOffset: 0);
+                                return;
+                            }
                         }
                     }
-                }
-                finally
-                {
-                    foreach (PyObject x in disposeList)
+                    finally
                     {
-                        x?.Dispose();
+                        foreach (PyObject x in disposeList)
+                        {
+                            x?.Dispose();
+                        }
+                        Runtime.PyGILState_Release(gs);
                     }
-                    Runtime.PyGILState_Release(gs);
+                }
+
+                if (origMethodName == null)
+                {
+                    throw new NotImplementedException($"Python object does not have a '{methodName}' method");
+                }
+
+                obj.GetType().InvokeMember(origMethodName,
+                    BindingFlags.InvokeMethod,
+                    null,
+                    obj,
+                    args);
+            }
+            finally
+            {
+                if (acquired)
+                {
+                    s_dispatching.Remove(dispatchKey);
                 }
             }
-
-            if (origMethodName == null)
-            {
-                throw new NotImplementedException($"Python object does not have a '{methodName}' method");
-            }
-
-            obj.GetType().InvokeMember(origMethodName,
-                BindingFlags.InvokeMethod,
-                null,
-                obj,
-                args);
         }
 
         /// <summary>
@@ -1250,7 +1343,15 @@ namespace Python.Runtime
 
             if (null == self.Ref)
             {
-                throw new NullReferenceException("Instance must be specified when getting a property");
+                // Object was created via FormatterServices.GetUninitializedObject
+                // (e.g., OpenTAP ComponentSettings deserialization bypasses ctors).
+                // Lazily create the Python wrapper now.
+                EnsurePythonWrapper(obj);
+                self = GetPyObj(obj);
+                if (null == self.Ref)
+                {
+                    throw new NullReferenceException("Instance must be specified when getting a property");
+                }
             }
 
             PyGILState gs = Runtime.PyGILState_Ensure();
@@ -1272,7 +1373,15 @@ namespace Python.Runtime
 
             if (null == self.Ref)
             {
-                throw new NullReferenceException("Instance must be specified when setting a property");
+                // Object was created via FormatterServices.GetUninitializedObject
+                // (e.g., OpenTAP ComponentSettings deserialization bypasses ctors).
+                // Lazily create the Python wrapper now.
+                EnsurePythonWrapper(obj);
+                self = GetPyObj(obj);
+                if (null == self.Ref)
+                {
+                    throw new NullReferenceException("Instance must be specified when setting a property");
+                }
             }
 
             PyGILState gs = Runtime.PyGILState_Ensure();
@@ -1285,6 +1394,35 @@ namespace Python.Runtime
             finally
             {
                 Runtime.PyGILState_Release(gs);
+            }
+        }
+
+        /// <summary>
+        /// Lazily creates the Python wrapper for a CLR object that was instantiated
+        /// without going through the IL-generated constructor (e.g.,
+        /// <c>FormatterServices.GetUninitializedObject</c> used by some serializers).
+        /// Safe to call multiple times — does nothing if the wrapper already exists.
+        /// </summary>
+        internal static void EnsurePythonWrapper(IPythonDerivedType obj)
+        {
+            var existing = GetPyObj(obj);
+            if (existing.Ref != null) return;
+
+            var gilState = Runtime.PyGILState_Ensure();
+            try
+            {
+                // Re-check under the GIL to avoid double-init under contention.
+                existing = GetPyObj(obj);
+                if (existing.Ref != null) return;
+
+                var pyRef = CLRObject.GetReference(obj, obj.GetType());
+                SetPyObj(obj, pyRef.Borrow());
+                // Intentionally NOT disposing pyRef — the reference must stay alive
+                // for the lifetime of the CLR object (mirrors InvokeCtor behavior).
+            }
+            finally
+            {
+                Runtime.PyGILState_Release(gilState);
             }
         }
 

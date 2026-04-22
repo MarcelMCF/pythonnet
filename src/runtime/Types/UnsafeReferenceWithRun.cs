@@ -19,6 +19,10 @@ public struct UnsafeReferenceWithRun
 
     internal BorrowedReference CheckRun()
     {
+        if (RawObj == IntPtr.Zero)
+            throw new InvalidOperationException(
+                "Python object reference is null. The derived object was never properly initialized via Python.");
+
         if (Run != Runtime.GetRun())
             throw new RuntimeShutdownException(RawObj);
 

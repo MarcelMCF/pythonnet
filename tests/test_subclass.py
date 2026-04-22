@@ -327,3 +327,54 @@ def test_generic_interface():
     obj = GenericInterfaceImpl()
     SpecificInterfaceUser(obj, Int32(0))
     GenericInterfaceUser[Int32](obj, Int32(0))
+
+
+def test_super_same_method_name_does_not_recurse():
+    """Regression test: a Python override that calls super().Method()
+    where Method has the SAME name as the override must dispatch to the
+    C# base method, not loop back into the override (which previously
+    caused a StackOverflowException)."""
+
+    class DerivedSameName(SubClassTest):
+        __namespace__ = "Python.Test." + test_super_same_method_name_does_not_recurse.__name__
+
+        def __init__(self):
+            super(DerivedSameName, self).__init__()
+            self.calls = 0
+
+        def foo(self):
+            self.calls += 1
+            # This must invoke SubClassTest.foo (C# base), not recurse.
+            base_value = super(DerivedSameName, self).foo()
+            return "derived+" + base_value
+
+    ob = DerivedSameName()
+    # Calling directly from Python.
+    assert ob.foo() == "derived+foo"
+    assert ob.calls == 1
+    # Calling via C# (which dispatches through the IL override stub).
+    assert FunctionsTest.test_foo(ob) == "derived+foo"
+    assert ob.calls == 2
+
+
+def test_super_same_method_name_void_does_not_recurse():
+    """Same regression as above, but exercises the void code path
+    (InvokeMethodVoid) by overriding a method whose return value is
+    ignored on the C# side."""
+
+    class DerivedVoidSameName(SubClassTest):
+        __namespace__ = "Python.Test." + test_super_same_method_name_void_does_not_recurse.__name__
+
+        def __init__(self):
+            super(DerivedVoidSameName, self).__init__()
+            self.events = []
+
+        def OnTestEvent(self, value):
+            self.events.append(value)
+            # Must reach the C# base, not recurse.
+            super(DerivedVoidSameName, self).OnTestEvent(value)
+
+    ob = DerivedVoidSameName()
+    ob.OnTestEvent(7)
+    assert ob.events == [7]
+

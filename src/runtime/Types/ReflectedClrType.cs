@@ -70,7 +70,8 @@ internal sealed class ReflectedClrType : PyType
 
     internal static NewReference CreateSubclass(ClassBase baseClass,
                                                 string name, string? assembly, string? ns,
-                                                BorrowedReference dict)
+                                                BorrowedReference dict,
+                                                Type[]? extraInterfaces = null)
     {
         try
         {
@@ -78,7 +79,8 @@ internal sealed class ReflectedClrType : PyType
                 baseClass.type.Value,
                 dict,
                 ns,
-                assembly);
+                assembly,
+                extraInterfaces: extraInterfaces);
 
             var py_type = GetOrCreate(subType);
 

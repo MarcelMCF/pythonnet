@@ -158,8 +158,8 @@ namespace Python.Runtime
         {
             if (derived == IntPtr.Zero)
             {
-                // The __pyobj__ field was already cleared (e.g., by EvictCollectable
-                // releasing the phantom reference). Nothing to finalize.
+                // The __pyobj__ field was already cleared (e.g., the object
+                // was destroyed during shutdown). Nothing to finalize.
                 return;
             }
 
