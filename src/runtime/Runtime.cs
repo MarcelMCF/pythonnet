@@ -395,6 +395,17 @@ namespace Python.Runtime
         public static int EvictAbandonedObjects(Func<object, bool>? isAbandoned = null)
             => CLRObject.EvictAbandonedObjects(isAbandoned);
 
+        /// <summary>
+        /// Diagnostic: returns the top-N most common .NET types currently
+        /// tracked in the reflected-objects set, with per-type counts,
+        /// total Python refcount, IPythonDerivedType count, and parentless
+        /// (i.e. orphaned ITestStep) count.
+        /// <para><b>Must hold GIL.</b></para>
+        /// </summary>
+        public static IReadOnlyList<(string TypeName, int Count, long TotalRc, int PythonDerivedCount, int ParentlessStepCount)>
+            DiagnoseTypeHistogram(int topN = 20)
+            => CLRObject.DiagnoseTypeHistogram(topN);
+
         static void DisposeLazyObject(Lazy<PyObject> pyObject)
         {
             if (pyObject.IsValueCreated)

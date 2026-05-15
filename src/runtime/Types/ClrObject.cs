@@ -51,6 +51,66 @@ namespace Python.Runtime
         }
 
         /// <summary>
+        /// Diagnostic: returns a histogram of the .NET types currently in
+        /// <see cref="reflectedObjects"/>.  Returns a list of
+        /// <c>(typeFullName, count, totalRefcount, isPythonDerived,
+        ///   parentlessSteps)</c> tuples sorted by count descending.
+        /// <para>Must hold the Python GIL.</para>
+        /// </summary>
+        internal static IReadOnlyList<(string TypeName, int Count, long TotalRc, int PythonDerivedCount, int ParentlessStepCount)>
+            DiagnoseTypeHistogram(int topN = 20)
+        {
+            var perType = new Dictionary<string, (int count, long rc, int pyDerived, int parentless)>(64);
+
+            foreach (var addr in reflectedObjects)
+            {
+                if (addr == IntPtr.Zero) continue;
+                try
+                {
+                    var borrowed = new BorrowedReference(addr);
+                    var handle = ManagedType.TryGetGCHandle(borrowed);
+                    if (handle is null || !handle.Value.IsAllocated) continue;
+                    var target = handle.Value.Target;
+                    if (target is not CLRObject clr) continue;
+
+                    object inst = clr.inst;
+                    if (inst is null) continue;
+
+                    string typeName = inst.GetType().FullName ?? inst.GetType().Name;
+                    long rc = Runtime.Refcount(borrowed);
+                    int isDerived = inst is IPythonDerivedType ? 1 : 0;
+                    int isParentless = 0;
+                    // Classify orphaned ITestStep without taking a hard
+                    // dependency on the OpenTAP types — duck-type via reflection
+                    // on a "Parent" property.
+                    try
+                    {
+                        var t = inst.GetType();
+                        var parentProp = t.GetProperty("Parent");
+                        if (parentProp != null)
+                        {
+                            var parent = parentProp.GetValue(inst);
+                            if (parent is null) isParentless = 1;
+                        }
+                    }
+                    catch { }
+
+                    if (perType.TryGetValue(typeName, out var entry))
+                        perType[typeName] = (entry.count + 1, entry.rc + rc, entry.pyDerived + isDerived, entry.parentless + isParentless);
+                    else
+                        perType[typeName] = (1, rc, isDerived, isParentless);
+                }
+                catch { }
+            }
+
+            return perType
+                .OrderByDescending(kv => kv.Value.count)
+                .Take(topN)
+                .Select(kv => (kv.Key, kv.Value.count, kv.Value.rc, kv.Value.pyDerived, kv.Value.parentless))
+                .ToList();
+        }
+
+        /// <summary>
         /// Scans the reflected-objects set for Python wrappers that are phantom
         /// references from <c>InvokeCtor</c> and can be safely released.
         /// <para>
@@ -82,6 +142,8 @@ namespace Python.Runtime
         /// <returns>Number of entries released.</returns>
         internal static int EvictAbandonedObjects(Func<object, bool>? isAbandoned = null)
         {
+            // LEAK-DEMO: neutralized to reproduce the original (unpatched) leak.
+            return 0;
             int count = reflectedObjects.Count;
             if (count == 0) return 0;
 
@@ -162,7 +224,11 @@ namespace Python.Runtime
             // contained CLR wrappers (TraceSource, enum values, etc.) may
             // have dropped to rc = 1.  Only release entries that were NOT
             // already rc = 1 before eviction (those are from still-alive objects).
-            if (released > 0)
+            //
+            // NOTE: Pass 2 always runs — even when Pass 1 found no abandoned
+            // entries. Stale rc=1 wrappers can accumulate from earlier cleanup
+            // cycles whose predicate did not match the current scenario; gating
+            // Pass 2 on Pass 1's result would leak them indefinitely.
             {
                 count = reflectedObjects.Count;
                 snapshot = new IntPtr[count];
